@@ -1,0 +1,161 @@
+import wfdb
+import neurokit2 as nk
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import os
+from scipy.signal import butter, filtfilt, savgol_filter, medfilt, stft
+from skimage import exposure
+
+# Configuring matplotlib backend to avoid rendering issues
+matplotlib.use('Agg')
+
+# Paths for data and results
+data_path = r'C:\Users\danie\OneDrive\Área de Trabalho\Dissertação\base-dados-apnea-ecg\apnea'
+output_path = r'C:\Users\danie\OneDrive\Área de Trabalho\Dissertação\espectrogramas_completo_X'
+os.makedirs(output_path, exist_ok=True)
+
+# Record name
+record_name = 'x35'
+
+# Loading ECG signal and annotations
+record = wfdb.rdrecord(record_name, pn_dir='apnea-ecg')
+annotation = wfdb.rdann(record_name, 'apn', pn_dir='apnea-ecg')
+
+# Getting basic signal information
+fs = record.fs
+sig_name = record.sig_name
+print(f'Number of Samples: {record.sig_len}')
+print(f'Sampling Frequency: {fs} Hz')
+print('Signal Information:')
+print(sig_name)
+
+# Extracting ECG signal in the desired interval
+start_time = 0
+end_time = 28800  # 8 hours in seconds
+start_sample = int(start_time * fs)
+end_sample = int(end_time * fs)
+sinal_ecg = record.p_signal[start_sample:end_sample, 0]
+
+# Converting annotation samples to time
+anotacao_tempo = annotation.sample / fs
+anotacao_tipo = annotation.symbol
+
+# Filtering annotations within the desired interval
+mask = (anotacao_tempo >= start_time) & (anotacao_tempo <= end_time)
+anotacao_tempo = anotacao_tempo[mask]
+anotacao_tipo = np.array(anotacao_tipo)[mask]
+
+# Printing filtered annotations
+for t, tipo in zip(anotacao_tempo, anotacao_tipo):
+    print(f'Annotation at {t} seconds: {tipo}')
+
+total_apneia = np.sum(anotacao_tipo == 'A')
+total_normal = np.sum(anotacao_tipo == 'N')
+print(f'Total Apnea periods: {total_apneia}')
+print(f'Total Normal periods: {total_normal}')
+
+# Detecting noise in the original signal
+amplitude_threshold = 3 * np.std(sinal_ecg)
+ruidos_detectados_original = np.where(np.abs(sinal_ecg) > amplitude_threshold)[0]
+print(f"Noise detected in the original signal: {len(ruidos_detectados_original)}")
+print(f"Amplitude threshold: {amplitude_threshold}")
+
+# Applying Median Filter
+sinal_ecg_mediano = medfilt(sinal_ecg, kernel_size=5)
+ruidos_detectados_mediano = np.where(np.abs(sinal_ecg_mediano) > amplitude_threshold)[0]
+print(f"Noise detected after Median Filter: {len(ruidos_detectados_mediano)}")
+
+# Applying Savitzky-Golay Filter
+sinal_ecg_savgol = savgol_filter(sinal_ecg_mediano, window_length=51, polyorder=3)
+ruidos_detectados_savgol = np.where(np.abs(sinal_ecg_savgol) > amplitude_threshold)[0]
+print(f"Noise detected after Savitzky-Golay Filter: {len(ruidos_detectados_savgol)}")
+
+# Applying High-Pass Butterworth Filter, if necessary
+if len(ruidos_detectados_savgol) > 0:
+    def apply_highpass_filter(signal, fs, cutoff=0.5, order=4):
+        nyquist = 0.5 * fs  # Nyquist frequency
+        normal_cutoff = cutoff / nyquist
+        b, a = butter(order, normal_cutoff, btype='high', analog=False)
+        return filtfilt(b, a, signal)
+
+    sinal_ecg_butterworth = apply_highpass_filter(sinal_ecg_savgol, fs, cutoff=0.5, order=4)
+    ruidos_detectados_butterworth = np.where(np.abs(sinal_ecg_butterworth) > amplitude_threshold)[0]
+    print(f"Noise detected after High-Pass Butterworth Filter: {len(ruidos_detectados_butterworth)}")
+else:
+    sinal_ecg_butterworth = sinal_ecg_savgol
+
+# Normalizing the final filtered signal
+sinal_ecg_normalizado = (sinal_ecg_butterworth - np.mean(sinal_ecg_butterworth)) / np.std(sinal_ecg_butterworth)
+
+# Processing the normalized signal with NeuroKit2
+try:
+    ecg_signals_normalizado, ecg_info_normalizado = nk.ecg_process(sinal_ecg_normalizado, sampling_rate=fs, method="neurokit2")
+except Exception as e:
+    print(f"Error processing normalized ECG: {e}")
+
+# Calculating STFT spectrogram
+nperseg = 1024
+noverlap = int(0.90 * nperseg)
+window_duration = 60
+step_duration = 60
+window_samples = int(window_duration * fs)
+step_samples = int(step_duration * fs)
+
+spectrogram_segments = []
+for start in range(0, len(sinal_ecg_normalizado) - window_samples + 1, step_samples):
+    end = start + window_samples
+    segment = sinal_ecg_normalizado[start:end]
+    f, t_segment, Zxx_segment = stft(segment, fs, nperseg=nperseg, noverlap=noverlap, window='hann')
+    f_limit_segment = f <= 30
+    spectrogram = np.abs(Zxx_segment[f_limit_segment, :])
+    spectrogram_normalized = (spectrogram - spectrogram.min()) / (spectrogram.max() - spectrogram.min())
+    spectrogram_equalized = exposure.equalize_adapthist(spectrogram_normalized, clip_limit=0.03)
+    spectrogram_segments.append((t_segment, f[f_limit_segment], spectrogram_equalized))
+
+# Create subfolders for Apnea and Normal
+apneia_path = os.path.join(output_path, 'Apnea')
+normal_path = os.path.join(output_path, 'Normal')
+os.makedirs(apneia_path, exist_ok=True)
+os.makedirs(normal_path, exist_ok=True)
+
+# Function to label segments and identify apnea intervals
+def label_segment_with_intervals(t_start, t_end, anotacao_tempo, anotacao_tipo):
+    eventos_apneia = [(start, start + 60) for start, tipo in zip(anotacao_tempo, anotacao_tipo) if tipo == 'A']
+    eventos_normal = [(start, start + 60) for start, tipo in zip(anotacao_tempo, anotacao_tipo) if tipo == 'N']
+
+    segment_type = 'Normal'
+    for start, end in eventos_apneia:
+        if start < t_end and end > t_start:  # Check overlap
+            segment_type = 'Apnea'
+            break
+
+    return segment_type
+
+# Loop to save labeled spectrograms with time intervals and apnea markings
+for idx, (t_segment, f_segment, Zxx_segment) in enumerate(spectrogram_segments):
+    t_start = idx * step_duration
+    t_end = t_start + window_duration
+
+    label = label_segment_with_intervals(t_start, t_end, anotacao_tempo, anotacao_tipo)
+
+    title = f"Segment {idx + 1}: - Equalized Spectrogram ({t_start}s to {t_end}s)"
+
+    plt.figure(figsize=(15, 5))
+    plt.pcolormesh(t_segment, f_segment, Zxx_segment, shading='gouraud')
+    plt.title(title)
+    plt.ylabel("Frequency (Hz)")
+    plt.xlabel("Time (s)")
+    plt.colorbar(label="Magnitude")
+
+    # Determine save path based on label
+    if label == 'Apnea':
+        save_path = os.path.join(apneia_path, f"segment_{idx + 1}_apneax35.png")
+    else:
+        save_path = os.path.join(normal_path, f"segment_{idx + 1}_normalx35.png")
+
+    # Save the image
+    plt.savefig(save_path)
+    plt.close()
+
+print(f"Processing complete! Spectrograms saved in: {output_path}")
