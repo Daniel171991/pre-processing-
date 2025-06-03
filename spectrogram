@@ -11,8 +11,8 @@ from skimage import exposure
 matplotlib.use('Agg')
 
 # Paths for data and results
-data_path = r'C:\Users\danie\OneDrive\Área de Trabalho\Dissertação\base-dados-apnea-ecg\apnea'
-output_path = r'C:\Users\danie\OneDrive\Área de Trabalho\Dissertação\espectrogramas_completo_X'
+data_path = r'database path'
+output_path = r''
 os.makedirs(output_path, exist_ok=True)
 
 # Record name
